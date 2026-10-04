@@ -2,8 +2,8 @@ name: IndexNow 自动提交
 
 on:
   schedule:
-    # GitHub Actions 现已支持 IANA 时区，可直接使用北京时间
-    # 如需兼容旧版（仅 UTC），请改用：cron: '15 12 * * *'
+    # 北京时间每天 20:15（IANA 时区写法）
+    # 如需兼容旧版 Actions（仅支持 UTC），可改为：cron: '15 12 * * *'
     - cron: '15 20 * * *'
       timezone: 'Asia/Shanghai'
   workflow_dispatch:  # 支持手动触发，方便测试
@@ -16,24 +16,24 @@ jobs:
       - name: 读取 URL 列表
         id: read-urls
         run: |
-          # 从远程 url.txt 获取 URL 列表，过滤空行和注释行
+          # 从远程 url.txt 获取 URL 列表，过滤空行和注释行，并去掉 Windows 换行符
           URL_LIST=$(curl -sL "https://skin.oak-ms.top/url.txt" \
             | grep -v '^\s*$' \
             | grep -v '^\s*#' \
             | sed 's/\r$//')
-          
+
           if [ -z "$URL_LIST" ]; then
             echo "❌ url.txt 为空或获取失败"
             exit 1
           fi
-          
+
           # 统计 URL 数量
           URL_COUNT=$(echo "$URL_LIST" | wc -l)
           echo "📋 共读取到 $URL_COUNT 个 URL"
-          
-          # 将 URL 列表转为 JSON 数组（使用 jq 处理转义）
-          URL_JSON=$(echo "$URL_LIST" | jq -R -s 'split("\n") | map(select(length > 0))')
-          echo "url_json=$URL_JSON" >> $GITHUB_OUTPUT
+
+          # 输出紧凑单行 JSON（-c 是关键，避免 GITHUB_OUTPUT 多行解析错误）
+          URL_JSON=$(echo "$URL_LIST" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "url_json=$URL_JSON" >> "$GITHUB_OUTPUT"
 
       - name: 提交至 IndexNow
         env:
@@ -53,19 +53,21 @@ jobs:
             }')
 
           echo "📤 正在提交 URL 列表..."
-          
+          echo "📦 Payload 预览："
+          echo "$PAYLOAD" | jq '.'
+
           # 提交至 IndexNow 统一端点
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             "https://api.indexnow.org/indexnow" \
             -H "Content-Type: application/json; charset=utf-8" \
             -d "$PAYLOAD")
-          
+
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | head -n-1)
-          
+
           echo "📬 HTTP 状态码：$HTTP_CODE"
           echo "📬 响应内容：$BODY"
-          
+
           # 根据状态码判断结果
           if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "202" ]; then
             echo "✅ IndexNow 提交成功"
