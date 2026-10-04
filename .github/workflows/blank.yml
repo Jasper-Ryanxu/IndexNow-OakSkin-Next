@@ -1,0 +1,75 @@
+name: IndexNow 自动提交
+
+on:
+  schedule:
+    # GitHub Actions 现已支持 IANA 时区，可直接使用北京时间
+    # 如需兼容旧版（仅 UTC），请改用：cron: '15 12 * * *'
+    - cron: '15 20 * * *'
+      timezone: 'Asia/Shanghai'
+  workflow_dispatch:  # 支持手动触发，方便测试
+
+jobs:
+  submit-indexnow:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 读取 URL 列表
+        id: read-urls
+        run: |
+          # 从远程 url.txt 获取 URL 列表，过滤空行和注释行
+          URL_LIST=$(curl -sL "https://skin.oak-ms.top/url.txt" \
+            | grep -v '^\s*$' \
+            | grep -v '^\s*#' \
+            | sed 's/\r$//')
+          
+          if [ -z "$URL_LIST" ]; then
+            echo "❌ url.txt 为空或获取失败"
+            exit 1
+          fi
+          
+          # 统计 URL 数量
+          URL_COUNT=$(echo "$URL_LIST" | wc -l)
+          echo "📋 共读取到 $URL_COUNT 个 URL"
+          
+          # 将 URL 列表转为 JSON 数组（使用 jq 处理转义）
+          URL_JSON=$(echo "$URL_LIST" | jq -R -s 'split("\n") | map(select(length > 0))')
+          echo "url_json=$URL_JSON" >> $GITHUB_OUTPUT
+
+      - name: 提交至 IndexNow
+        env:
+          INDEXNOW_KEY: ${{ secrets.INDEXNOW_KEY }}
+        run: |
+          # 构建完整的 JSON payload
+          PAYLOAD=$(jq -n \
+            --arg host "skin.oak-ms.top" \
+            --arg key "$INDEXNOW_KEY" \
+            --arg keyLocation "https://skin.oak-ms.top/${INDEXNOW_KEY}.txt" \
+            --argjson urlList '${{ steps.read-urls.outputs.url_json }}' \
+            '{
+              host: $host,
+              key: $key,
+              keyLocation: $keyLocation,
+              urlList: $urlList
+            }')
+
+          echo "📤 正在提交 URL 列表..."
+          
+          # 提交至 IndexNow 统一端点
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.indexnow.org/indexnow" \
+            -H "Content-Type: application/json; charset=utf-8" \
+            -d "$PAYLOAD")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n-1)
+          
+          echo "📬 HTTP 状态码：$HTTP_CODE"
+          echo "📬 响应内容：$BODY"
+          
+          # 根据状态码判断结果
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "202" ]; then
+            echo "✅ IndexNow 提交成功"
+          else
+            echo "⚠️ IndexNow 返回非预期状态码：$HTTP_CODE"
+            exit 1
+          fi
