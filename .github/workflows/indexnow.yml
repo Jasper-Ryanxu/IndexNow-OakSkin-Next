@@ -1,72 +1,3 @@
-name: IndexNow + Bing API 自动提交
-
-on:
-  schedule:
-    # 北京时间每天 9:00（新 IANA 时区写法）
-    - cron: '0 9 * * *'
-      timezone: 'Asia/Shanghai'
-  workflow_dispatch:  # 支持手动触发
-
-jobs:
-  submit:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: 读取 URL 列表
-        id: read-urls
-        run: |
-          URL_LIST=$(curl -sL "https://skin.oak-ms.top/url.txt" \
-            | grep -v '^\s*$' \
-            | grep -v '^\s*#' \
-            | sed 's/\r$//')
-
-          if [ -z "$URL_LIST" ]; then
-            echo "❌ url.txt 为空或获取失败"
-            exit 1
-          fi
-
-          URL_COUNT=$(echo "$URL_LIST" | wc -l)
-          echo "📋 共读取到 $URL_COUNT 个 URL"
-
-          # 紧凑单行 JSON（-c 避免 GITHUB_OUTPUT 多行解析失败）
-          URL_JSON=$(echo "$URL_LIST" | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          echo "url_json=$URL_JSON" >> "$GITHUB_OUTPUT"
-
-      # ============================================================
-      # 1) 提交至 IndexNow（统一端点，覆盖 Bing/Yandex/Seznam 等）
-      # ============================================================
-      - name: 提交至 IndexNow
-        env:
-          INDEXNOW_KEY: ${{ secrets.INDEXNOW_KEY }}
-        run: |
-          PAYLOAD=$(jq -n \
-            --arg host "skin.oak-ms.top" \
-            --arg key "$INDEXNOW_KEY" \
-            --arg keyLocation "https://skin.oak-ms.top/${INDEXNOW_KEY}.txt" \
-            --argjson urlList '${{ steps.read-urls.outputs.url_json }}' \
-            '{host:$host, key:$key, keyLocation:$keyLocation, urlList:$urlList}')
-
-          echo "📤 [IndexNow] 正在提交..."
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-            "https://api.indexnow.org/indexnow" \
-            -H "Content-Type: application/json; charset=utf-8" \
-            -d "$PAYLOAD")
-
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | head -n-1)
-          echo "📬 [IndexNow] HTTP：$HTTP_CODE"
-          echo "📬 [IndexNow] 响应：$BODY"
-
-          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "202" ]; then
-            echo "✅ [IndexNow] 提交成功"
-          else
-            echo "⚠️ [IndexNow] 非预期状态码：$HTTP_CODE"
-            exit 1
-          fi
-
-      # ============================================================
-      # 2) 提交至 Bing Webmaster API（SubmitUrlbatch，最多 500/批）
-      # ============================================================
       - name: 提交至 Bing Webmaster API
         env:
           BING_API_KEY: ${{ secrets.BING_API_KEY }}
@@ -76,12 +7,22 @@ jobs:
           TOTAL=$(echo "$URL_JSON" | jq 'length')
           echo "📤 [Bing] 共 $TOTAL 个 URL 待提交"
 
-          # Bing SubmitUrlbatch 每批最多 500 个 URL，分批处理
-          BATCH_SIZE=500
+          # Bing 默认每天每站配额 100，BATCH_SIZE 与 MAX_SUBMIT 都不能超过它
+          BATCH_SIZE=100
+          MAX_SUBMIT=100
+
+          if [ "$TOTAL" -gt "$MAX_SUBMIT" ]; then
+            echo "⚠️ [Bing] 今日配额上限 $MAX_SUBMIT，本次仅提交前 $MAX_SUBMIT 个 URL（其余由 IndexNow 覆盖）"
+            URL_JSON=$(echo "$URL_JSON" | jq -c ".[0:$MAX_SUBMIT]")
+            TOTAL=$MAX_SUBMIT
+          fi
+
           i=0
           while [ "$i" -lt "$TOTAL" ]; do
-            BATCH=$(echo "$URL_JSON" | jq -c ".[$i:$((i+BATCH_SIZE))]")
-            echo "➡️ [Bing] 提交第 $((i+1)) ~ $((i+BATCH_SIZE > TOTAL ? TOTAL : i+BATCH_SIZE)) 个"
+            END=$((i + BATCH_SIZE))
+            [ "$END" -gt "$TOTAL" ] && END=$TOTAL
+            BATCH=$(echo "$URL_JSON" | jq -c ".[$i:$END]")
+            echo "➡️ [Bing] 提交第 $((i+1)) ~ $END 个"
 
             BING_BODY=$(jq -n \
               --arg siteUrl "$SITE_URL" \
@@ -98,6 +39,12 @@ jobs:
             echo "📬 [Bing] HTTP：$HTTP_CODE"
             echo "📬 [Bing] 响应：$BODY"
 
+            # 配额超限：跳过剩余批次，不视为失败（IndexNow 已完成 Bing 同步）
+            if [ "$HTTP_CODE" = "400" ] && echo "$BODY" | grep -qi "quota"; then
+              echo "⚠️ [Bing] 配额已用尽，跳过剩余批次"
+              break
+            fi
+
             if [ "$HTTP_CODE" != "200" ]; then
               echo "⚠️ [Bing] 非预期状态码：$HTTP_CODE"
               exit 1
@@ -106,4 +53,4 @@ jobs:
             i=$((i + BATCH_SIZE))
           done
 
-          echo "✅ [Bing] 全部批次提交完成"
+          echo "✅ [Bing] 处理完成"
